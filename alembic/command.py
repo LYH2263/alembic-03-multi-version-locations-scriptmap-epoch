@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import pathlib
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from . import autogenerate as autogen
@@ -15,6 +17,7 @@ from .util import compat
 if TYPE_CHECKING:
     from alembic.config import Config
     from alembic.script.base import Script
+    from alembic.script.base import ScriptGeneration
     from alembic.script.revision import _RevIdType
     from .runtime.environment import ProcessRevisionDirectiveFn
 
@@ -200,6 +203,8 @@ def revision(
     rev_id: str | None = None,
     depends_on: str | None = None,
     process_revision_directives: ProcessRevisionDirectiveFn | None = None,
+    version_locations: Sequence[str | os.PathLike[str]] | None = None,
+    recursive_version_locations: bool | None = None,
 ) -> Script | None | list[Script | None]:
     """Create a new revision file.
 
@@ -244,6 +249,19 @@ def revision(
      the other parameters, this option is only available via programmatic
      use of :func:`.command.revision`.
 
+    :param version_locations: optional override of the version locations
+     for this revision only.  When given, a nested
+     :class:`.ScriptGeneration` is entered for revision discovery,
+     head/walk resolution and new-file landing, then popped again when
+     the command finishes; the script directory's startup union graph is
+     left untouched.  Passing a single location narrows the union graph
+     (so no ``--version-path`` is needed to decide where the file lands);
+     a ``version_path`` named for the new file must be a member of this
+     list.
+
+    :param recursive_version_locations: optional override of recursive
+     version-location discovery for this revision only.
+
     """
 
     script_directory = ScriptDirectory.from_config(config)
@@ -259,58 +277,75 @@ def revision(
         rev_id=rev_id,
         depends_on=depends_on,
     )
-    revision_context = autogen.RevisionContext(
-        config,
-        script_directory,
-        command_args,
-        process_revision_directives=process_revision_directives,
-    )
-
-    environment = util.asbool(
-        config.get_alembic_option("revision_environment")
-    )
-
-    if autogenerate:
-        environment = True
-
-        if sql:
-            raise util.CommandError(
-                "Using --sql with --autogenerate does not make any sense"
-            )
-
-        def retrieve_migrations(rev, context):
-            revision_context.run_autogenerate(rev, context)
-            return []
-
-    elif environment:
-
-        def retrieve_migrations(rev, context):
-            revision_context.run_no_autogenerate(rev, context)
-            return []
-
-    elif sql:
-        raise util.CommandError(
-            "Using --sql with the revision command when "
-            "revision_environment is not configured does not make any sense"
+    script_generation: contextlib.AbstractContextManager[
+        ScriptGeneration | None
+    ]
+    if (
+        version_locations is not None
+        or recursive_version_locations is not None
+    ):
+        script_generation = script_directory.generation(
+            version_locations=version_locations,
+            recursive_version_locations=recursive_version_locations,
         )
+    else:
+        script_generation = contextlib.nullcontext()
 
-    if environment:
-        with EnvironmentContext(
+    with script_generation:
+        revision_context = autogen.RevisionContext(
             config,
             script_directory,
-            fn=retrieve_migrations,
-            as_sql=sql,
-            template_args=revision_context.template_args,
-            revision_context=revision_context,
-        ):
-            script_directory.run_env()
+            command_args,
+            process_revision_directives=process_revision_directives,
+        )
 
-        # the revision_context now has MigrationScript structure(s) present.
-        # these could theoretically be further processed / rewritten *here*,
-        # in addition to the hooks present within each run_migrations() call,
-        # or at the end of env.py run_migrations_online().
+        environment = util.asbool(
+            config.get_alembic_option("revision_environment")
+        )
 
-    scripts = [script for script in revision_context.generate_scripts()]
+        if autogenerate:
+            environment = True
+
+            if sql:
+                raise util.CommandError(
+                    "Using --sql with --autogenerate does not make any sense"
+                )
+
+            def retrieve_migrations(rev, context):
+                revision_context.run_autogenerate(rev, context)
+                return []
+
+        elif environment:
+
+            def retrieve_migrations(rev, context):
+                revision_context.run_no_autogenerate(rev, context)
+                return []
+
+        elif sql:
+            raise util.CommandError(
+                "Using --sql with the revision command when "
+                "revision_environment is not configured does not make any "
+                "sense"
+            )
+
+        if environment:
+            with EnvironmentContext(
+                config,
+                script_directory,
+                fn=retrieve_migrations,
+                as_sql=sql,
+                template_args=revision_context.template_args,
+                revision_context=revision_context,
+            ):
+                script_directory.run_env()
+
+            # the revision_context now has MigrationScript structure(s)
+            # present. these could theoretically be further processed /
+            # rewritten *here*, in addition to the hooks present within each
+            # run_migrations() call, or at the end of env.py
+            # run_migrations_online().
+
+        scripts = [script for script in revision_context.generate_scripts()]
     if len(scripts) == 1:
         return scripts[0]
     else:

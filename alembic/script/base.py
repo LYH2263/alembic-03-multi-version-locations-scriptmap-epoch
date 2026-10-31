@@ -46,6 +46,158 @@ _slug_re = re.compile(r"\w+")
 _default_file_template = "%(rev)s_%(slug)s"
 
 
+class ScriptGeneration:
+    """One immutable generation of the multi-location script graph.
+
+    A generation binds together three concerns that otherwise behave as
+    unrelated ledgers:
+
+    * the set of ``version_locations`` (along with whether discovery
+      descends recursively into subdirectories) used to discover script
+      files,
+    * the :class:`.RevisionMap` loaded as a single union graph from those
+      locations,
+    * the rules deciding where a newly generated revision file is allowed
+      to land.
+
+    Generations are never refreshed in place.  Advancing to a different
+    location set, to a different recursive-discovery mode, or to a pinned
+    landing intent builds a new :class:`.ScriptGeneration` with its own,
+    lazily loaded :class:`.RevisionMap`; the previous map and location list
+    stay frozen and continue serving the scope that was already using them.
+    This is what lets an outer environment keep walking its original union
+    graph while an inner environment generates against a different location
+    set, and what prevents a popped generation from leaving ghost revisions
+    behind.
+
+    .. seealso::
+
+        :meth:`.ScriptDirectory.generation`
+
+    """
+
+    def __init__(
+        self,
+        script_directory: ScriptDirectory,
+        version_locations: Sequence[str | os.PathLike[str]] | None,
+        recursive_version_locations: bool,
+        default_version_path: str | os.PathLike[str] | None,
+        explicit_locations: bool,
+        generation_id: int,
+    ) -> None:
+        self.script_directory = script_directory
+        self.generation_id = generation_id
+        self.explicit_locations = explicit_locations
+        self.recursive_version_locations = bool(recursive_version_locations)
+
+        if version_locations:
+            self.version_locations: tuple[Path, ...] = tuple(
+                util.coerce_resource_to_filename(
+                    _preserving_path_as_str(location)
+                ).absolute()
+                for location in version_locations
+            )
+        else:
+            self.version_locations = (
+                Path(script_directory.dir, "versions").absolute(),
+            )
+
+        if default_version_path is not None:
+            self.default_version_path: Path | None = self._require_location(
+                Path(default_version_path)
+            )
+        else:
+            self.default_version_path = None
+
+        # the union revision graph is private to this generation; a new
+        # generation gets a separate RevisionMap rather than a memo reset
+        # on this one.
+        self.revision_map = revision.RevisionMap(
+            self._generate_revisions, script_generation=self
+        )
+
+    def _generate_revisions(self) -> Iterator[Script]:
+        paths = [vers for vers in self.version_locations if vers.exists()]
+
+        dupes: set[Path] = set()
+        for vers in paths:
+            for file_path in Script._list_py_dir(
+                self.script_directory,
+                vers,
+                self.recursive_version_locations,
+            ):
+                real_path = file_path.resolve()
+                if real_path in dupes:
+                    util.warn(
+                        f"File {real_path} loaded twice! ignoring. "
+                        "Please ensure version_locations is unique."
+                    )
+                    continue
+                dupes.add(real_path)
+
+                script = Script._from_path(self.script_directory, real_path)
+                if script is None:
+                    continue
+                yield script
+
+    @property
+    def singular_version_location(self) -> Path:
+        """Return the sole location of this generation or raise.
+
+        Reading the single version directory from a multi-location
+        generation is an error rather than silently using the first
+        location.
+
+        """
+        loc = self.version_locations
+        if len(loc) > 1:
+            raise util.CommandError("Multiple version_locations present")
+        else:
+            return loc[0]
+
+    def _require_location(self, version_path: Path) -> Path:
+        norm_path = version_path.absolute()
+        for vers_path in self.version_locations:
+            if vers_path.absolute() == norm_path:
+                return vers_path
+        raise util.CommandError(
+            f"Path {version_path} is not represented in current "
+            "version locations"
+        )
+
+    def resolve_version_path(
+        self,
+        version_path: str | os.PathLike[str] | None,
+        heads: Sequence[Revision | None],
+    ) -> Path:
+        """Determine and validate the landing directory for a new revision.
+
+        An explicit ``version_path`` wins and must belong to this
+        generation's locations.  Otherwise this generation's pinned landing
+        intent wins; under multiple locations without a pin, the landing
+        directory is inferred from the parent directory of the first
+        selected head script; if there is no head script to infer from, the
+        caller is required to name a location.
+
+        """
+        if version_path is not None:
+            return self._require_location(Path(version_path))
+        elif self.default_version_path is not None:
+            return self._require_location(self.default_version_path)
+        elif len(self.version_locations) > 1:
+            for head in heads:
+                if head is not None:
+                    assert isinstance(head, Script)
+                    return self._require_location(head._script_path.parent)
+            else:
+                raise util.CommandError(
+                    "Multiple version locations present, "
+                    "please specify --version-path"
+                )
+        else:
+            return self.singular_version_location
+
+
 class ScriptDirectory:
     """Provides operations upon an Alembic script directory.
 
@@ -89,11 +241,25 @@ class ScriptDirectory:
         self.truncate_slug_length = truncate_slug_length or 40
         self.sourceless = sourceless
         self.output_encoding = output_encoding
-        self.revision_map = revision.RevisionMap(self._load_revisions)
         self.timezone = timezone
         self.hooks = hooks
         self.recursive_version_locations = recursive_version_locations
         self.messaging_opts = messaging_opts
+
+        # the initial (generation 0) script graph; nested or advanced
+        # generations stack on top of it and are popped/retired without
+        # mutating this one's memos.
+        self._generation_seq = 0
+        self._generation_stack: list[ScriptGeneration] = [
+            ScriptGeneration(
+                self,
+                self.version_locations,
+                self.recursive_version_locations,
+                default_version_path=None,
+                explicit_locations=bool(self.version_locations),
+                generation_id=self._generation_seq,
+            )
+        ]
 
         if not os.access(dir, os.F_OK):
             raise util.CommandError(
@@ -103,53 +269,149 @@ class ScriptDirectory:
             )
 
     @property
+    def current_generation(self) -> ScriptGeneration:
+        """The :class:`.ScriptGeneration` currently in effect.
+
+        Union-graph access (:attr:`.revision_map`, :meth:`.walk_revisions`,
+        ...) and revision landing (:meth:`.generate_revision`) are both
+        bound to this generation.
+
+        """
+        return self._generation_stack[-1]
+
+    @property
+    def revision_map(self) -> revision.RevisionMap:
+        """The union :class:`.RevisionMap` of :attr:`.current_generation`.
+
+        This always resolves through the generation stack, so a nested or
+        advanced generation is observed immediately while the previously
+        active map stays frozen and untouched.
+
+        """
+        return self.current_generation.revision_map
+
+    def push_generation(
+        self,
+        *,
+        version_locations: None | (Sequence[str | os.PathLike[str]]) = None,
+        recursive_version_locations: bool | None = None,
+        version_path: str | os.PathLike[str] | None = None,
+    ) -> ScriptGeneration:
+        """Advance to a new script generation and make it current.
+
+        :param version_locations: optional replacement for the configured
+         version locations.  When omitted, the new generation inherits the
+         locations this :class:`.ScriptDirectory` was constructed with.
+        :param recursive_version_locations: optional override for recursive
+         script discovery.  When omitted, the construction-time setting is
+         inherited.
+        :param version_path: optional pinned landing intent; revision files
+         generated without an explicit ``version_path`` land here.  The
+         path must be part of the new generation's locations.
+
+        The generation that was current stays on the stack and is restored
+        by :meth:`.pop_generation` (or automatically by the
+        :meth:`.generation` context manager).  The new generation carries a
+        fresh :class:`.RevisionMap`; memos of the previous generation are
+        neither cleared nor consulted by subsequent generate/walk calls.
+
+        """
+        if version_locations is None:
+            resolved_locations: Sequence[str | os.PathLike[str]] | None = (
+                self.version_locations
+            )
+            explicit = bool(self.version_locations)
+        else:
+            resolved_locations = list(version_locations)
+            explicit = bool(resolved_locations)
+
+        if recursive_version_locations is None:
+            recursive_version_locations = self.recursive_version_locations
+
+        self._generation_seq += 1
+        generation = ScriptGeneration(
+            self,
+            resolved_locations,
+            recursive_version_locations,
+            default_version_path=version_path,
+            explicit_locations=explicit,
+            generation_id=self._generation_seq,
+        )
+        self._generation_stack.append(generation)
+        return generation
+
+    def pop_generation(
+        self, generation: ScriptGeneration | None = None
+    ) -> ScriptGeneration:
+        """Restore the generation underneath the current one.
+
+        Fails rather than popping the initial generation, and refuses to
+        pop when the supplied generation is not the current one so that
+        mismatched nesting cannot silently discard outer generations.
+
+        """
+        if len(self._generation_stack) <= 1:
+            raise util.CommandError(
+                "Cannot pop the initial script generation"
+            )
+        current = self._generation_stack[-1]
+        if generation is not None and current is not generation:
+            raise util.CommandError(
+                "Script generation nesting mismatch; the generation being "
+                "popped is not the current generation"
+            )
+        return self._generation_stack.pop()
+
+    @contextmanager
+    def generation(
+        self,
+        *,
+        version_locations: None | (Sequence[str | os.PathLike[str]]) = None,
+        recursive_version_locations: bool | None = None,
+        version_path: str | os.PathLike[str] | None = None,
+    ) -> Iterator[ScriptGeneration]:
+        """Run a block under a new, nested script generation.
+
+        On exit -- including an exit caused by an exception -- the outer
+        generation is restored along with its frozen union revision map,
+        location set and landing rules.  Files the inner generation writes
+        into a shared directory do not retroactively appear in the outer
+        map.
+
+        .. seealso::
+
+            :meth:`.push_generation`
+
+        """
+        next_generation = self.push_generation(
+            version_locations=version_locations,
+            recursive_version_locations=recursive_version_locations,
+            version_path=version_path,
+        )
+        try:
+            yield next_generation
+        finally:
+            self.pop_generation(next_generation)
+
+    @property
     def versions(self) -> str:
         """return a single version location based on the sole path passed
         within version_locations.
 
-        If multiple version locations are configured, an error is raised.
+        If multiple version locations are configured in the current
+        generation, an error is raised.
 
 
         """
-        return str(self._singular_version_location)
+        return str(self.current_generation.singular_version_location)
 
-    @util.memoized_property
+    @property
     def _singular_version_location(self) -> Path:
-        loc = self._version_locations
-        if len(loc) > 1:
-            raise util.CommandError("Multiple version_locations present")
-        else:
-            return loc[0]
+        return self.current_generation.singular_version_location
 
-    @util.memoized_property
-    def _version_locations(self) -> Sequence[Path]:
-        if self.version_locations:
-            return [
-                util.coerce_resource_to_filename(location).absolute()
-                for location in self.version_locations
-            ]
-        else:
-            return [Path(self.dir, "versions").absolute()]
-
-    def _load_revisions(self) -> Iterator[Script]:
-        paths = [vers for vers in self._version_locations if vers.exists()]
-
-        dupes = set()
-        for vers in paths:
-            for file_path in Script._list_py_dir(self, vers):
-                real_path = file_path.resolve()
-                if real_path in dupes:
-                    util.warn(
-                        f"File {real_path} loaded twice! ignoring. "
-                        "Please ensure version_locations is unique."
-                    )
-                    continue
-                dupes.add(real_path)
-
-                script = Script._from_path(self, real_path)
-                if script is None:
-                    continue
-                yield script
+    @property
+    def _version_locations(self) -> list[Path]:
+        return list(self.current_generation.version_locations)
 
     @classmethod
     def from_config(cls, config: Config) -> ScriptDirectory:
@@ -650,6 +912,8 @@ class ScriptDirectory:
         except revision.RevisionError as err:
             raise util.CommandError(err.args[0]) from err
 
+        generation = self.current_generation
+
         with self._catch_revision_errors(
             multiple_heads=(
                 "Multiple heads are present; please specify the head "
@@ -659,7 +923,7 @@ class ScriptDirectory:
         ):
             heads = cast(
                 tuple[Optional["Revision"], ...],
-                self.revision_map.get_revisions(head),
+                generation.revision_map.get_revisions(head),
             )
             for h in heads:
                 assert h != "base"  # type: ignore[comparison-overlap]
@@ -669,35 +933,13 @@ class ScriptDirectory:
 
         create_date = self._generate_create_date()
 
-        if version_path is None:
-            if len(self._version_locations) > 1:
-                for head_ in heads:
-                    if head_ is not None:
-                        assert isinstance(head_, Script)
-                        version_path = head_._script_path.parent
-                        break
-                else:
-                    raise util.CommandError(
-                        "Multiple version locations present, "
-                        "please specify --version-path"
-                    )
-            else:
-                version_path = self._singular_version_location
-        else:
-            version_path = Path(version_path)
-
+        # landing inference/validation is part of the current generation;
+        # a pinned inner intent or a narrowed location set is honored here
+        # without consulting any retired generation's location list.
+        version_path = generation.resolve_version_path(version_path, heads)
         assert isinstance(version_path, Path)
-        norm_path = version_path.absolute()
-        for vers_path in self._version_locations:
-            if vers_path.absolute() == norm_path:
-                break
-        else:
-            raise util.CommandError(
-                f"Path {version_path} is not represented in current "
-                "version locations"
-            )
 
-        if self.version_locations:
+        if generation.explicit_locations:
             self._ensure_directory(version_path)
 
         path = self._rev_path(version_path, revid, message, create_date)
@@ -722,7 +964,12 @@ class ScriptDirectory:
                         else rev.revision
                     )  # resolve partial revision identifiers
                     for rev, dep in [
-                        (not_none(self.revision_map.get_revision(dep)), dep)
+                        (
+                            not_none(
+                                generation.revision_map.get_revision(dep)
+                            ),
+                            dep,
+                        )
                         for dep in util.to_list(depends_on)
                     ]
                 ]
@@ -762,7 +1009,7 @@ class ScriptDirectory:
                 "'branch_labels' section?"
                 % (script.revision, branch_labels, script.path)
             )
-        self.revision_map.add_revision(script)
+        generation.revision_map.add_revision(script)
         return script
 
     def _rev_path(
@@ -963,7 +1210,10 @@ class Script(revision.Revision):
 
     @classmethod
     def _list_py_dir(
-        cls, scriptdir: ScriptDirectory, path: Path
+        cls,
+        scriptdir: ScriptDirectory,
+        path: Path,
+        recursive_version_locations: bool,
     ) -> list[Path]:
         paths = []
         for root, dirs, files in compat.path_walk(path, top_down=True):
@@ -991,7 +1241,7 @@ class Script(revision.Revision):
                         if pyc.name.split(".")[0] not in names
                     )
 
-            if not scriptdir.recursive_version_locations:
+            if not recursive_version_locations:
                 break
 
             # the real script order is defined by revision,

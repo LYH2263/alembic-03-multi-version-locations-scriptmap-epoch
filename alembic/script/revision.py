@@ -25,6 +25,8 @@ from ..util import not_none
 if TYPE_CHECKING:
     from typing import Literal
 
+    from .base import ScriptGeneration
+
 _RevIdType = Union[str, list[str], tuple[str, ...]]
 _GetRevArg = Union[
     str,
@@ -127,15 +129,26 @@ class RevisionMap:
 
     """
 
-    def __init__(self, generator: Callable[[], Iterable[Revision]]) -> None:
+    def __init__(
+        self,
+        generator: Callable[[], Iterable[Revision]],
+        *,
+        script_generation: ScriptGeneration | None = None,
+    ) -> None:
         """Construct a new :class:`.RevisionMap`.
 
         :param generator: a zero-arg callable that will generate an iterable
          of :class:`.Revision` instances to be used.   These are typically
          :class:`.Script` subclasses within regular Alembic use.
 
+        :param script_generation: the :class:`.ScriptGeneration` whose
+         version-location discovery produced this map.  A map is always
+         loaded for exactly one generation; advancing to a new generation
+         constructs a new map instead of resetting memos on this one.
+
         """
         self._generator = generator
+        self.script_generation = script_generation
 
     @util.memoized_property
     def heads(self) -> tuple[str, ...]:
